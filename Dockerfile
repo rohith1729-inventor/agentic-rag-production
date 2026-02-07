@@ -21,8 +21,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY download_model.py .
 RUN python download_model.py
 
-# Copy application code (to be added later)
-# COPY . .
+# Copy application code
+COPY shared/ shared/
+COPY main.py ingest.py ops.py eval.py prompt.md ./
+COPY data/ data/
 
 # Expose port
 EXPOSE 8000

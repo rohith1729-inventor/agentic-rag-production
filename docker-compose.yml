@@ -25,6 +25,8 @@ services:
       - qdrant
     volumes:
       - .:/app
+      - model_cache:/app/models
 
 volumes:
   qdrant_data:
+  model_cache:
