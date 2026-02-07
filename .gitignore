@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+
+# Model caches
+models/
+.cache/
+sentence_transformers/
+
+# Docker / runtime
+*.log
+
+# OS
+.DS_Store
+
+# Qdrant local data
+qdrant_data/
+
+# Claude / bootstrap artifacts
+backup_*/
+memory/notes/*.tmp
