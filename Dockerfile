@@ -23,6 +23,8 @@ RUN python download_model.py
 
 # Copy application code
 COPY shared/ shared/
+COPY rag_core/ rag_core/
+COPY prompts/ prompts/
 COPY main.py ingest.py ops.py eval.py prompt.md ./
 COPY data/ data/
 

@@ -1,8 +1,8 @@
 """
 Ingestion pipeline for RAG project.
 
-Loads PDF, Markdown, and plain text documents from a data directory,
-chunks them, generates embeddings, and upserts into Qdrant.
+Loads documents via pluggable adapters, chunks them, generates embeddings,
+and upserts into Qdrant.
 
 Usage:
     python ingest.py                  # uses default "data" directory
@@ -12,7 +12,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import glob
 import hashlib
 import os
 import sys
@@ -21,22 +20,13 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pypdf import PdfReader
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, PointStruct, VectorParams
 from sentence_transformers import SentenceTransformer
 
+from rag_core.config import get_config
+from rag_core.ingest import FilesystemAdapter
 from shared.schema import ChunkMeta, QdrantPoint
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-COLLECTION_NAME = "knowledge_base"
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
-MIN_CHUNK_SIZE = 100
-DEFAULT_DATA_DIR = "data"
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -72,74 +62,6 @@ def _text_preview(text: str, max_len: int = 100) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Document loading
-# ---------------------------------------------------------------------------
-
-
-def _load_pdf(file_path: str) -> List[Dict]:
-    """
-    Extract text from a PDF file, one entry per physical page.
-    Returns a list of dicts: {"source": str, "text": str, "page_index": int}
-    """
-    pages: List[Dict] = []
-    reader = PdfReader(file_path)
-    for page_index, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        text = text.strip()
-        if text:
-            pages.append({
-                "source": file_path,
-                "text": text,
-                "page_index": page_index,
-            })
-    return pages
-
-
-def _load_text_file(file_path: str) -> List[Dict]:
-    """
-    Load a plain text or markdown file.
-    Returns a list with one dict: {"source": str, "text": str, "page_index": None}
-    """
-    with open(file_path, "r", encoding="utf-8") as f:
-        text = f.read().strip()
-    if not text:
-        return []
-    return [{"source": file_path, "text": text, "page_index": None}]
-
-
-def load_documents(data_dir: str) -> Tuple[List[Dict], int]:
-    """
-    Discover and load all supported files (*.pdf, *.md, *.txt) from *data_dir*.
-
-    Returns:
-        (page_entries, doc_count)
-        Each page_entry has keys: source, text, page_index.
-    """
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir)
-        print(f"Created '{data_dir}' directory. Please add documents and re-run.")
-        return [], 0
-
-    patterns = ["**/*.pdf", "**/*.md", "**/*.txt"]
-    files: List[str] = []
-    for pat in patterns:
-        files.extend(glob.glob(os.path.join(data_dir, pat), recursive=True))
-    # Deduplicate (a file could match multiple patterns theoretically) and sort
-    files = sorted(set(files))
-
-    print(f"Found {len(files)} document(s) in '{data_dir}'.")
-    all_entries: List[Dict] = []
-    for fpath in files:
-        if fpath.lower().endswith(".pdf"):
-            entries = _load_pdf(fpath)
-        else:
-            entries = _load_text_file(fpath)
-        all_entries.extend(entries)
-
-    return all_entries, len(files)
-
-
-# ---------------------------------------------------------------------------
 # Chunking
 # ---------------------------------------------------------------------------
 
@@ -158,10 +80,8 @@ def _merge_small_chunks(chunks: List[str], min_size: int) -> List[str]:
             continue
 
         if len(chunk) < min_size:
-            # Tiny chunk -- merge into current
             current = current + "\n" + chunk
         elif len(current) < min_size:
-            # Current is tiny -- merge incoming into it
             current = current + "\n" + chunk
         else:
             merged.append(current)
@@ -173,23 +93,20 @@ def _merge_small_chunks(chunks: List[str], min_size: int) -> List[str]:
     return merged
 
 
-def chunk_entries(
-    entries: List[Dict],
-) -> List[Dict]:
+def chunk_entries(entries: List[Dict]) -> List[Dict]:
     """
     Split each page entry into overlapping chunks using RecursiveCharacterTextSplitter.
     Returns a flat list of dicts with keys:
-        source, page_index, chunk_index, text
+        source, page_index, chunk_index, text, source_type
     """
+    cfg = get_config()
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
+        chunk_size=cfg.chunk_size,
+        chunk_overlap=cfg.chunk_overlap,
         length_function=len,
         is_separator_regex=False,
     )
 
-    # Group entries by source to assign chunk_index per document
-    # (chunk_index is global across all pages of a single document)
     source_entries: Dict[str, List[Dict]] = {}
     for entry in entries:
         source_entries.setdefault(entry["source"], []).append(entry)
@@ -200,13 +117,14 @@ def chunk_entries(
         chunk_counter = 0
         for entry in page_entries:
             raw_chunks = splitter.split_text(entry["text"])
-            merged_chunks = _merge_small_chunks(raw_chunks, MIN_CHUNK_SIZE)
+            merged_chunks = _merge_small_chunks(raw_chunks, cfg.min_chunk_size)
             for chunk_text in merged_chunks:
                 all_chunks.append({
                     "source": source,
                     "page_index": entry["page_index"],
                     "chunk_index": chunk_counter,
                     "text": chunk_text,
+                    "source_type": entry.get("source_type"),
                 })
                 chunk_counter += 1
 
@@ -222,9 +140,7 @@ def build_points(
     chunks: List[Dict],
     model: SentenceTransformer,
 ) -> List[QdrantPoint]:
-    """
-    Generate embeddings and construct QdrantPoint objects for each chunk.
-    """
+    """Generate embeddings and construct QdrantPoint objects for each chunk."""
     if not chunks:
         return []
 
@@ -249,6 +165,7 @@ def build_points(
             source_path=chunk["source"],
             chunk_id=chunk_id,
             chunk_index=chunk_index,
+            source_type=chunk.get("source_type"),
             page_index=page_index,
             page_label=None,
             text=chunk["text"],
@@ -278,27 +195,23 @@ def upsert_to_qdrant(points: List[QdrantPoint]) -> int:
     Connect to Qdrant, ensure collection exists, and upsert all points.
     Returns the total point count in the collection after upsert.
     """
-    host = os.getenv("QDRANT_HOST", "localhost")
-    port = int(os.getenv("QDRANT_PORT", "6333"))
+    cfg = get_config()
 
-    print(f"Connecting to Qdrant at {host}:{port} ...")
-    client = QdrantClient(host=host, port=port)
+    print(f"Connecting to Qdrant at {cfg.qdrant_host}:{cfg.qdrant_port} ...")
+    client = QdrantClient(host=cfg.qdrant_host, port=cfg.qdrant_port)
 
-    # Determine vector size from the first point
-    vector_size = len(points[0].vector) if points else 384  # MiniLM default
+    vector_size = len(points[0].vector) if points else 384
 
-    # Create collection if it does not exist
     collections = [c.name for c in client.get_collections().collections]
-    if COLLECTION_NAME not in collections:
-        print(f"Creating collection '{COLLECTION_NAME}' (dim={vector_size}, COSINE) ...")
+    if cfg.collection_name not in collections:
+        print(f"Creating collection '{cfg.collection_name}' (dim={vector_size}, COSINE) ...")
         client.create_collection(
-            collection_name=COLLECTION_NAME,
+            collection_name=cfg.collection_name,
             vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
         )
     else:
-        print(f"Collection '{COLLECTION_NAME}' already exists.")
+        print(f"Collection '{cfg.collection_name}' already exists.")
 
-    # Upsert in batches of 100
     batch_size = 100
     for i in range(0, len(points), batch_size):
         batch = points[i : i + batch_size]
@@ -310,11 +223,10 @@ def upsert_to_qdrant(points: List[QdrantPoint]) -> int:
             )
             for p in batch
         ]
-        client.upsert(collection_name=COLLECTION_NAME, points=qdrant_points)
+        client.upsert(collection_name=cfg.collection_name, points=qdrant_points)
         print(f"  Upserted batch {i // batch_size + 1} ({len(batch)} points)")
 
-    # Get final count
-    info = client.get_collection(collection_name=COLLECTION_NAME)
+    info = client.get_collection(collection_name=cfg.collection_name)
     return info.points_count
 
 
@@ -324,14 +236,16 @@ def upsert_to_qdrant(points: List[QdrantPoint]) -> int:
 
 
 def main() -> None:
+    cfg = get_config()
+
     parser = argparse.ArgumentParser(
         description="Ingest documents into Qdrant for RAG."
     )
     parser.add_argument(
         "--path",
         type=str,
-        default=DEFAULT_DATA_DIR,
-        help=f"Path to data directory (default: {DEFAULT_DATA_DIR})",
+        default=cfg.default_data_dir,
+        help=f"Path to data directory (default: {cfg.default_data_dir})",
     )
     args = parser.parse_args()
     data_dir = args.path
@@ -340,8 +254,9 @@ def main() -> None:
     print("RAG Ingestion Pipeline")
     print("=" * 60)
 
-    # 1. Load documents
-    entries, doc_count = load_documents(data_dir)
+    # 1. Load documents via adapter
+    adapter = FilesystemAdapter()
+    entries, doc_count = adapter.load(data_dir)
     if not entries:
         print("No document content found. Exiting.")
         sys.exit(0)
@@ -353,15 +268,14 @@ def main() -> None:
     print(f"Produced {len(chunks)} chunk(s) after splitting and merging.")
 
     # 3. Load embedding model
-    model_path = os.getenv("MODEL_PATH")
-    if model_path and os.path.isdir(model_path):
-        print(f"Loading embedding model from MODEL_PATH: {model_path}")
-        model = SentenceTransformer(model_path)
+    model_path = cfg.model_path
+    if os.path.isdir(model_path):
+        print(f"Loading embedding model from path: {model_path}")
     else:
-        print(f"Loading embedding model: {MODEL_NAME}")
-        model = SentenceTransformer(MODEL_NAME)
+        print(f"Loading embedding model: {model_path}")
+    model = SentenceTransformer(model_path)
 
-    # 4. Build QdrantPoint objects (embed + metadata)
+    # 4. Build QdrantPoint objects
     points = build_points(chunks, model)
     print(f"Built {len(points)} QdrantPoint(s).")
 

@@ -10,6 +10,12 @@ class ChunkMeta(BaseModel):
     chunk_id: str = Field(..., description="Unique chunk id")
     chunk_index: int = Field(..., ge=0)
 
+    # Source metadata (adapter-provided)
+    source_type: Optional[str] = Field(
+        default=None,
+        description="Source type identifier, e.g. 'pdf', 'md', 'txt'. Set by ingestion adapter."
+    )
+
     # PDF specific
     page_index: Optional[int] = Field(
         default=None,
@@ -37,6 +43,14 @@ class QueryRequest(BaseModel):
     top_k: int = 20
     top_n: int = 5
     token_budget: int = 6000
+    retrieval_profile: Optional[str] = Field(
+        default=None,
+        description="Named retrieval profile. None uses default pipeline behavior."
+    )
+    prompt_id: Optional[str] = Field(
+        default="default",
+        description="Prompt template identifier. Maps to prompts/{prompt_id}.md."
+    )
 
 
 class Citation(BaseModel):
